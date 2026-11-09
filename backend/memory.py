@@ -189,22 +189,17 @@ def reflect(team_id: str, prompt: str) -> str:
         except Exception as e:
             print(f"[WARN] Live reflect error: {e}")
 
+    # Fallback (Hindsight not live): synthesise over what this server holds in local memory, with the real LLM. Nothing is pre-written.
+    import llm
+    from fastapi import HTTPException
     records = _FALLBACK_INCIDENTS.get(b_id, [])
-    count = len(records)
-    return (
-        f"### Enterprise Systemic Risk & Recurring Pattern Analysis ({count} Incidents Synthesized)\n\n"
-        "**1. Recurring Root Cause Clusters:**\n"
-        "- **Connection & Resource Leaks:** Multiple incidents (INC-101, INC-112) stemmed from unclosed connection transactions and infinite cache key lifecycles bypassing TTL policies.\n"
-        "- **Automated Configuration Drift:** TLS certificate and webhook expiration (INC-107) occurred due to forgotten cron dependencies during OS migration.\n"
-        "- **Deployment Verification Gaps:** Deployments breaking backwards schema compatibility (INC-118) caused immediate cascading service crashes.\n\n"
-        "**2. Anti-Patterns Identified (Interventions that Failed):**\n"
-        "- Blindly scaling worker or application pods during database or downstream rate limiting (e.g., INC-101, INC-124) amplified downstream saturation instead of fixing it.\n"
-        "- Running cache flush commands (`FLUSHALL`) triggered catastrophic database stampedes.\n\n"
-        "**3. Recommended Prioritized Guardrails:**\n"
-        "- Enforce mandatory TTL linters for all Redis cache key definitions in CI.\n"
-        "- Implement automated Canary health probes that monitor database pool usage for 10 minutes post-deploy before traffic ramping.\n"
-        "- Deploy automated 14-day TLS certificate expiry alerts with automated vault rotation."
-    )
+    if not records:
+        raise HTTPException(409, "There is nothing in memory to analyse yet. Record some incidents first.")
+    corpus = "\n\n".join(f"[{r.get('incident_id')}] {r['content'][:700]}" for r in records[:40])
+    return llm.complete(
+        "You analyse a team's incident history for recurring patterns. Use ONLY the records given; cite incident IDs from the brackets; never invent incidents. "
+        "Plain text with these headings on their own lines: RECURRING CAUSES, WHAT FAILED BEFORE, WHAT TO DO ABOUT IT (3 prioritised actions). No markdown symbols, no emojis.",
+        f"{prompt}\n\nINCIDENT RECORDS ({len(records)}):\n{corpus}")
 
 def list_all_retained(team_id: str) -> List[Dict[str, Any]]:
     b_id = bank_for(team_id)

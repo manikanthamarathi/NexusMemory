@@ -21,12 +21,17 @@ import memory
 import llm
 import web_intelligence
 import simulator
+import otp
+import mailer
+import guided
 
 AUTO_HEAL_THRESHOLD = float(os.getenv("AUTO_HEAL_THRESHOLD", "90.0"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_database()
+    otp.init()
+    guided.init()
     memory.ensure_bank("nexus-core", "Nexus Enterprise Core")
     
     # Sync SQLite solutions into Hindsight memory
@@ -67,6 +72,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(guided.router)
+
 
 class SendOtpRequest(BaseModel):
     email: str
@@ -122,53 +130,38 @@ def get_health():
 @app.post("/api/auth/send-otp")
 def send_email_otp(req: SendOtpRequest):
     email = req.email.strip().lower()
-    # Generate real 6-digit cryptographic verification code
-    code = f"{random.randint(100000, 999999)}"
-    expires = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
-    
-    conn = db.get_connection()
-    conn.execute("INSERT OR REPLACE INTO email_otps (email, otp_code, expires_at, verified) VALUES (?, ?, ?, 0)", (email, code, expires))
-    conn.commit()
-    conn.close()
-
-    return {
-        "success": True,
-        "email": email,
-        "message": f"Verification OTP dispatched to {email}. (Security preview: {code})",
-        "otp_preview": code
-    }
+    if "@" not in email or len(email) > 254:
+        raise HTTPException(422, "Enter a valid email address.")
+    res = otp.issue(email)
+    if res["wait"]:
+        raise HTTPException(429, f"Please wait {res['wait']} seconds before requesting another code.")
+    if not res["sent"] and not res["dev_code"]:
+        raise HTTPException(503, "The verification email could not be sent. The server's email (SMTP) settings are missing or wrong.")
+    out = {"success": True, "email": email, "message": f"A 6-digit code was sent to {email}. It expires in {otp.TTL_MIN} minutes."}
+    if res["dev_code"]:  # only when SMTP is not configured AND DEV_SHOW_OTP=true (local development)
+        out["otp_preview"] = res["dev_code"]
+        out["message"] = "Development mode: email is not configured, so the code is shown here."
+    return out
 
 @app.post("/api/auth/verify-otp")
 def verify_email_otp(req: VerifyOtpRequest):
-    email = req.email.strip().lower()
-    code = req.otp_code.strip()
-    
-    conn = db.get_connection()
-    row = conn.execute("SELECT * FROM email_otps WHERE email = ?", (email,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(400, "No OTP request found for this email. Please request a code.")
-    
-    if row["otp_code"] != code:
-        conn.close()
-        raise HTTPException(400, "Invalid verification OTP code. Please check and retry.")
-    
-    conn.execute("UPDATE email_otps SET verified = 1 WHERE email = ?", (email,))
-    conn.commit()
-    conn.close()
-    
-    return {"success": True, "message": "Email address verified successfully."}
+    ok, msg = otp.verify(req.email.strip().lower(), req.otp_code)
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"success": True, "message": msg}
 
 @app.post("/api/auth/register-real")
 def register_real_employee(req: RealRegisterRequest):
     email = req.email.strip().lower()
     
     # 1. Verify OTP was confirmed
+    if not otp.consume_verified(email):
+        raise HTTPException(400, "Email verification required. Verify the 6-digit code first (codes expire after 10 minutes).")
     conn = db.get_connection()
-    otp_row = conn.execute("SELECT * FROM email_otps WHERE email = ?", (email,)).fetchone()
-    if not otp_row or (otp_row["otp_code"] != req.otp_code and otp_row["verified"] == 0):
+    clash = conn.execute("SELECT id, email FROM employees WHERE id = ? OR email = ?", (req.employee_id.upper(), email)).fetchone()
+    if clash:
         conn.close()
-        raise HTTPException(400, "Email verification required. Please verify with the 6-digit OTP code.")
+        raise HTTPException(409, "That employee ID or email is already registered. Sign in instead.")
 
     # 2. Real GPS Office Geofencing calculation
     target_campus = next((c for c in db.CAMPUSES if c["id"] == req.target_campus_id), db.CAMPUSES[0])
@@ -224,6 +217,7 @@ def register_real_employee(req: RealRegisterRequest):
 
     return {
         "success": True,
+        "token": guided.make_token(emp_data["id"]),
         "employee": emp_data,
         "office_verified": bool(verified_office),
         "distance_km": distance_km,
@@ -241,14 +235,14 @@ def login_real_employee(req: RealLoginRequest):
         row = conn.execute("SELECT * FROM employees WHERE email = ?", (req.employee_id.strip().lower(),)).fetchone()
     
     if not row:
-        # Fallback to default lead
-        row = conn.execute("SELECT * FROM employees WHERE id = 'EMP-1042'").fetchone()
+        conn.close()
+        raise HTTPException(404, "No account found for that employee ID or email. Register first.")
 
     emp_dict = dict(row)
     conn.close()
     return {
         "success": True,
-        "token": f"NEXUS-SQLITE-{int(time.time())}",
+        "token": guided.make_token(emp_dict["id"]),
         "employee": emp_dict,
         "message": f"Successfully authenticated as {emp_dict['name']}."
     }
@@ -298,84 +292,20 @@ def triage_issue(req: TriageRequest):
     external_solution = None
     q_low = req.alert_text.lower()
     
-    # -------------------------------------------------------------
-    # 1. STATELESS AI AGENT (AMNESIC - ZERO MEMORY ACCESS)
-    # -------------------------------------------------------------
+    # 1. STATELESS BASELINE MODE: the same model, but told nothing about this company's history (a real "amnesia" comparison)
     if not req.use_memory:
-        if any(k in q_low for k in ["redis", "ttl", "eviction", "keys/sec", "flushall"]):
-            stateless_answer = (
-                "### ⚠️ Generic Stateless Triage (Zero Organizational Context)\n\n"
-                "**Likely Diagnosis**: Redis in-memory cache exhaustion / memory threshold breach.\n\n"
-                "**Standard Generic Cloud Troubleshooting Steps**:\n"
-                "1. Flush all cache keys immediately to reclaim memory:\n"
-                "   `redis-cli -h redis-cluster-core FLUSHALL`\n"
-                "2. Vertically scale Redis cluster instance size (e.g. scale up AWS ElastiCache node type).\n"
-                "3. Restart application connection pools to reset client TCP connections.\n\n"
-                "> ⚠️ **CRITICAL ANTI-PATTERN WARNING**:\n"
-                "> Stateless AI has zero institutional memory of your architecture.\n"
-                "> Executing `FLUSHALL` in production will wipe active user session cache and trigger a catastrophic database cache stampede against PostgreSQL.\n"
-                "> No internal post-mortems or verified engineer solutions were consulted."
-            )
-        elif any(k in q_low for k in ["ssl", "certificate", "cert", "expired", "razorpay"]):
-            stateless_answer = (
-                "### ⚠️ Generic Stateless Triage (Zero Organizational Context)\n\n"
-                "**Likely Diagnosis**: TLS/SSL certificate verification failure on ingress webhook gateway.\n\n"
-                "**Standard Generic Cloud Troubleshooting Steps**:\n"
-                "1. Temporarily disable SSL verification in the webhook client proxy configuration (`insecure_skip_verify = true`).\n"
-                "2. Restart the ingress controller deployment.\n"
-                "3. Clear local DNS and gateway cache.\n\n"
-                "> ⚠️ **CRITICAL SECURITY WARNING**:\n"
-                "> Stateless AI has zero organizational context. Disabling SSL verification directly violates PCI-DSS payment compliance and exposes customer financial transactions to Man-in-the-Middle (MitM) attacks.\n"
-                "> No internal post-mortems or verified engineer solutions were consulted."
-            )
-        elif any(k in q_low for k in ["oom", "kernel", "cgroup", "137", "checkout-service"]):
-            stateless_answer = (
-                "### ⚠️ Generic Stateless Triage (Zero Organizational Context)\n\n"
-                "**Likely Diagnosis**: Kubernetes node memory pressure / cgroup OOM-killer invocation (Exit Code 137).\n\n"
-                "**Standard Generic Cloud Troubleshooting Steps**:\n"
-                "1. Remove or dramatically increase container memory limits in pod deployment spec:\n"
-                "   `resources.limits.memory: null`\n"
-                "2. Restart the affected service deployment pods.\n"
-                "3. Review container logs in Datadog/Grafana.\n\n"
-                "> ⚠️ **CRITICAL OPERATIONAL RISK**:\n"
-                "> Stateless AI lacks infrastructure context. Removing memory limits allows runaway JVM heap processes to cause node-level kernel panics and evict critical kube-system daemons."
-            )
-        else:
-            stateless_answer = (
-                "### ⚠️ Generic Stateless Triage (Zero Organizational Context)\n\n"
-                "**Likely Diagnosis**: Database thread starvation or sudden unindexed traffic surge on checkout endpoint.\n\n"
-                "**Standard Generic Cloud Troubleshooting Steps**:\n"
-                "1. Restart the payment-service deployment pods to flush stuck connections:\n"
-                "   `kubectl rollout restart deployment/payment-service`\n"
-                "2. Scale deployment replicas from 6 to 14 pods to absorb the incoming request queue.\n"
-                "3. Check CPU and memory utilization in Grafana.\n\n"
-                "> ⚠️ **CRITICAL ANTI-PATTERN WARNING**:\n"
-                "> Stateless AI lacks organizational memory and does not know your database connection limits.\n"
-                "> Scaling pods to 14 will exhaust PostgreSQL `max_connections` ceiling globally and deadlock the entire database cluster.\n"
-                "> Restarting pods only buys ~8 minutes before connection handles leak again.\n"
-                "> No internal post-mortems or verified engineer solutions were consulted."
-            )
-        elapsed_ms = round((time.time() - t0) * 1000, 2)
+        ai_answer = llm.complete(
+            "You are a generic incident-response assistant with NO access to this company's history, past incidents or runbooks. "
+            "Answer only from the alert text and general engineering knowledge. " + llm.ANSWER_STYLE,
+            f"INCOMING ERROR TELEMETRY:\n{req.alert_text}")
         return {
-            "answer": stateless_answer,
-            "internal_match": None,
-            "external_solution": None,
-            "impact_result": None,
-            "self_healing": {
-                "attempted": False,
-                "auto_healed": False,
-                "confidence": 0.0,
-                "action_taken": "Stateless mode: Autonomous healing disabled.",
-                "message": "Zero institutional memory active."
-            },
-            "memories_used": [],
-            "execution_time_ms": elapsed_ms,
-            "mode": "Stateless Baseline"
+            "answer": ai_answer, "internal_match": None, "external_solution": None, "recalled_memories": [], "impact_analysis": None,
+            "self_healing": {"attempted": False, "auto_healed": False, "confidence": 0.0,
+                             "action_taken": "Stateless mode: no memory, no automatic recommendation.", "message": "Zero institutional memory active."},
+            "elapsed_ms": round((time.time() - t0) * 1000, 2), "mode": "Stateless Baseline"
         }
 
-    # -------------------------------------------------------------
-    # 2. NEXUSMEMORY AUTONOMOUS AGENT (ENTERPRISE BRAIN WITH MEMORY)
-    # -------------------------------------------------------------
+    # 2. NEXUSMEMORY ENTERPRISE BRAIN MODE (Powered by Hindsight Persistent Memory)
     try:
         recalled_items = memory.recall("nexus-core", req.alert_text)
     except Exception as e:
@@ -390,21 +320,21 @@ def triage_issue(req: TriageRequest):
     JOIN employees e ON s.resolved_by_id = e.id
     """).fetchall()
     
-    # Priority keyword routing
+    # Match specific outage types in prioritized order
     target_inc = None
-    if any(k in q_low for k in ["redis", "eviction", "keys/sec", "ttl bloat", "flushall"]):
-        target_inc = "INC-112"
+    if any(k in q_low for k in ["hikari", "connection is not available", "timed out after 30000ms", "maxlifetime"]):
+        target_inc = "INC-101"
     elif any(k in q_low for k in ["ssl", "certificate", "cert", "expired", "razorpay"]):
         target_inc = "INC-107"
-    elif any(k in q_low for k in ["hikari", "connection is not available", "timed out after 30000ms", "maxlifetime"]):
-        target_inc = "INC-101"
+    elif any(k in q_low for k in ["redis", "eviction", "keys/sec", "ttl bloat", "flushall"]):
+        target_inc = "INC-112"
 
     for r in rows:
         sol = dict(r)
         if target_inc and sol["incident_id"] == target_inc:
             internal_match = sol
             break
-        elif not target_inc and sol["service"].lower() in q_low and not any(k in q_low for k in ["oom", "kernel", "cgroup"]):
+        elif not target_inc and sol["service"].lower() in q_low:
             internal_match = sol
             break
     conn.close()
@@ -424,27 +354,15 @@ def triage_issue(req: TriageRequest):
         )
     elif recalled_items:
         context = "\n".join([f"- {m['text']}" for m in recalled_items])
-        
     prompt = (f"INCIDENT MEMORY:\n{context}\n\n" if context else "INCIDENT MEMORY: (none)\n\n") + f"INCOMING ERROR TELEMETRY:\n{req.alert_text}"
     system_prompt = (
-        "You are NexusMemory Autonomous SRE Copilot backed by Hindsight Persistent Memory. "
-        "Generate a structured Markdown triage runbook: Likely root cause, ordered first 3 steps, and critical anti-patterns (what NOT to try). "
-        "Explicitly cite the internal engineer who verified the fix, incident ID, and line patch from INCIDENT MEMORY."
+        "You are the NexusMemory SRE copilot. You DO have this company's incident memory (below). Use it: name the past incident ID and the engineer "
+        "who solved it, repeat what failed before as things NOT to do, and give the proven fix. If memory does not apply, say so plainly and do not invent history. "
+        + llm.ANSWER_STYLE
     )
     
     ai_answer = llm.complete(system_prompt, prompt)
-    if not ai_answer and internal_match:
-        ai_answer = (
-            f"🎯 **ENTERPRISE MEMORY-AUGMENTED SRE RUNBOOK (POWERED BY HINDSIGHT):**\n\n"
-            f"• **Historical Match:** Correlated with **{internal_match['incident_id']}**, previously resolved by **{internal_match['resolver_name']} ({internal_match['resolver_role']})**.\n"
-            f"• **Verified Root Cause:** {internal_match['root_cause']}\n\n"
-            f"• **⚠️ CRITICAL ANTI-PATTERNS (FAILED ATTEMPTS - NEVER REPEAT):**\n"
-            f"  {internal_match['failed_attempts']}\n\n"
-            f"• **✅ VERIFIED PROVEN REPAIR (CONFIDENCE: {internal_match['confidence_score']}%):**\n"
-            f"  1. Target File: `{internal_match['file_path']}` (Line {internal_match['exact_line']})\n"
-            f"  2. Apply exact patch and commit to release branch:\n     ```diff\n{internal_match['code_diff']}\n     ```\n"
-            f"  3. Benchmark MTTR: Previously resolved in **4-10 minutes** with zero cascading downtime."
-        )
+    
     impact_result = None
     if req.proposed_step:
         impact_result = simulator.simulate_what_if(req.proposed_step, req.alert_text)
@@ -453,10 +371,10 @@ def triage_issue(req: TriageRequest):
     
     self_healing = {
         "attempted": True,
-        "auto_healed": bool(confidence >= AUTO_HEAL_THRESHOLD and internal_match),
+        "auto_healed": False,
         "confidence": confidence,
-        "action_taken": f"Auto-applied verified patch by {internal_match['resolver_name']}: {internal_match['file_path']}:{internal_match['exact_line']}" if (confidence >= AUTO_HEAL_THRESHOLD and internal_match) else "Safety threshold: Paused for human lead confirmation.",
-        "message": "Confidence verified (>=90%). Auto-healed service with verified patch." if (confidence >= AUTO_HEAL_THRESHOLD and internal_match) else "Dispatched escalation alert to on-call engineer."
+        "action_taken": f"Recommended patch from {internal_match['resolver_name']}: {internal_match['file_path']}:{internal_match['exact_line']}. Nothing is changed automatically; an engineer must review and apply it." if (confidence >= AUTO_HEAL_THRESHOLD and internal_match) else "Confidence is below the safety threshold: follow the guided steps and involve a human lead.",
+        "message": "High-confidence match with a recorded past fix. Review it, then work through the guided steps below." if (confidence >= AUTO_HEAL_THRESHOLD and internal_match) else "No high-confidence match. Treat the answer as guidance and escalate if it does not resolve the issue."
     }
 
     elapsed_ms = round((time.time() - t0) * 1000, 2)
@@ -488,35 +406,22 @@ def analyze_patterns():
     }
 
 @app.post("/api/upload-multimodal")
-async def upload_multimodal(
-    file: UploadFile = File(...),
-    notes: Optional[str] = Form(None)
-):
-    content = await file.read()
-    filename = file.filename
-    decoded_text = content[:1000].decode("utf-8", errors="ignore")
-    
+async def upload_multimodal(file: UploadFile = File(...), notes: Optional[str] = Form(None)):
+    import fileutil
+    content = await file.read(11 * 1024 * 1024)
+    if not content or len(content) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Files must be between 1 byte and 10 MB.")
+    try:
+        info = fileutil.inspect(fileutil.safe_name(file.filename or "file"), content)
+    except HTTPException as e:
+        raise HTTPException(e.status_code, e.detail["message"] if isinstance(e.detail, dict) else e.detail)
     doc_id = f"DOC-{int(time.time())}"
-    memory.retain(
-        team_id="nexus-core",
-        content=f"Uploaded Asset: {filename}. Description: {notes or 'User submitted bug artifact'}. Content sample: {decoded_text}",
-        incident_id=doc_id,
-        metadata={"filename": str(filename), "type": "multimodal_asset"}
-    )
-    
-    return {
-        "success": True,
-        "asset_id": doc_id,
-        "filename": filename,
-        "size_bytes": len(content),
-        "status": "RETAINED_INTO_HINDSIGHT",
-        "message": f"Successfully parsed {filename} and ingested into persistent memory graph."
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    print(f"\n🚀 Starting NexusMemory Backend on http://{host}:{port}\n")
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+    if info.kind == "image":
+        raise HTTPException(422, "Screenshots cannot be stored as knowledge (no readable text). Attach them to a guided triage step instead.")
+    if not (info.text or "").strip():
+        raise HTTPException(422, "No readable text was found in this file (is it a scanned PDF?).")
+    memory.retain(team_id="nexus-core", content=f"Document: {file.filename}. Notes: {notes or '-'}\n{info.text[:6000]}", incident_id=doc_id,
+                  metadata={"filename": str(file.filename), "type": "document"})
+    return {"success": True, "asset_id": doc_id, "filename": file.filename, "size_bytes": len(content), "characters_read": len(info.text),
+            "status": "RETAINED_INTO_HINDSIGHT" if memory.is_live_mode() else "RETAINED_LOCALLY_ONLY",
+            "message": f"Read {len(info.text):,} characters from {file.filename}. " + ("Saved to Hindsight memory." if memory.is_live_mode() else "Saved to local memory only: Hindsight is not connected.")}
